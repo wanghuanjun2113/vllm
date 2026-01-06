@@ -104,6 +104,9 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        template_kv_manager=None,
+        template_registry=None,
+        template_mapper=None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -130,6 +133,11 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        # Template-based caching support
+        self.template_kv_manager = template_kv_manager
+        self.template_registry = template_registry
+        self.template_mapper = template_mapper
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -173,6 +181,14 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        # Check if this is a template-based request
+        if (getattr(request, 'is_template_request', False) and
+            self.template_kv_manager is not None and
+            self.template_mapper is not None and
+            self.template_registry is not None):
+            return self._get_template_cached_blocks(request)
+
+        # Regular prefix caching logic
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -202,6 +218,93 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _get_template_cached_blocks(
+        self,
+        request: Request,
+    ) -> tuple[KVCacheBlocks, int]:
+        """Get cached blocks for a template-based request.
+
+        This method handles template requests by:
+        1. Mapping the request to a template
+        2. Retrieving cached template KV blocks
+        3. Returning blocks for the full template
+
+        Args:
+            request: The template request
+
+        Returns:
+            Tuple of (KVCacheBlocks, num_computed_tokens)
+        """
+        # Map request to template
+        mapping = self.template_mapper.map_request(
+            request,
+            request.template_id
+        )
+
+        if mapping is None:
+            # Mapping failed - fall back to regular processing
+            logger.warning(
+                f"Failed to map request '{request.request_id}' to template, "
+                "falling back to regular prefix caching"
+            )
+            request.is_template_request = False
+            # Recursively call get_computed_blocks for regular processing
+            return self.get_computed_blocks(request)
+
+        # Store mapping for attention mask generation
+        request.template_mapping = mapping
+
+        # Get template from registry
+        template_id = mapping.template_id
+        template = self.template_registry.get_template(template_id)
+        if template is None:
+            logger.error(f"Template '{template_id}' not found in registry")
+            request.is_template_request = False
+            return self.empty_kv_cache_blocks, 0
+
+        # Get template blocks from cache
+        template_blocks = self.template_kv_manager.get_template_blocks(template_id)
+
+        if template_blocks is None:
+            # Template not cached yet - need to register it
+            logger.info(
+                f"Template '{template_id}' not cached yet, "
+                f"triggering registration for request '{request.request_id}'"
+            )
+
+            # TODO: Trigger template registration
+            # This requires integration with model executor
+            # For now, fall back to regular processing
+            logger.warning(
+                f"Template '{template_id}' registration not yet implemented, "
+                "falling back to regular processing"
+            )
+            request.is_template_request = False
+            return self.get_computed_blocks(request)
+
+        # Convert template blocks to KVCacheBlocks format
+        # template_blocks is a list of blocks, need to create tuple for each group
+        num_computed_tokens = len(template.prompt_token_ids)
+        computed_blocks = tuple([template_blocks] for _ in range(self.num_kv_cache_groups))
+
+        logger.info(
+            f"Template cache HIT for request '{request.request_id}': "
+            f"'{template_id}' ({num_computed_tokens} tokens, "
+            f"{len(template_blocks)} blocks, "
+            f"{mapping.num_selected_apis} APIs selected)"
+        )
+
+        # Record stats if enabled
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record(
+                num_tokens=request.num_tokens,
+                num_hits=num_computed_tokens,
+                preempted=request.num_preemptions > 0,
+            )
+
+        return self.create_kv_cache_blocks(computed_blocks), num_computed_tokens
 
     def allocate_slots(
         self,

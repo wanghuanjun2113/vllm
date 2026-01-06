@@ -32,6 +32,9 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.template_kv_manager import TemplateKVCacheManager
+from vllm.v1.core.template_mapper import TemplateRequestMapper
+from vllm.v1.core.template_registry import TemplateRegistry
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -204,6 +207,48 @@ class Scheduler(SchedulerInterface):
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        # Initialize template-based caching system (if enabled)
+        self.template_registry = None
+        self.template_kv_manager = None
+        self.template_mapper = None
+
+        # Check if template caching is enabled via cache_config
+        # (This will be properly configured in Phase 4.2)
+        template_config_path = getattr(self.cache_config, 'template_config_path', None)
+        enable_template_caching = getattr(self.cache_config, 'enable_template_caching', False)
+
+        if enable_template_caching:
+            logger.info("Template-based caching enabled, initializing components...")
+            try:
+                # Initialize template registry
+                self.template_registry = TemplateRegistry()
+
+                # Initialize template KV manager
+                max_cached_templates = getattr(self.cache_config, 'max_cached_templates', 5)
+                self.template_kv_manager = TemplateKVCacheManager(
+                    block_pool=None,  # Will be set after KVCacheManager is created
+                    registry=self.template_registry,
+                    max_cached_templates=max_cached_templates,
+                )
+
+                # Template mapper will be created later when tokenizer is available
+                self.template_mapper = None
+
+                # Load template from config if provided
+                if template_config_path:
+                    # Note: This requires tokenizer which we don't have yet
+                    # Template loading will happen in engine initialization
+                    logger.info(f"Template config path: {template_config_path}")
+                    pass
+
+                logger.info("Template caching components initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize template caching: {e}")
+                # Disable template caching on error
+                self.template_registry = None
+                self.template_kv_manager = None
+                self.template_mapper = None
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -216,7 +261,14 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            template_kv_manager=self.template_kv_manager,
+            template_registry=self.template_registry,
+            template_mapper=self.template_mapper,
         )
+
+        # Now set block_pool for template_kv_manager since KVCacheManager has it
+        if self.template_kv_manager is not None:
+            self.template_kv_manager.block_pool = self.kv_cache_manager.block_pool
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
