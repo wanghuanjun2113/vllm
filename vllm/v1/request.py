@@ -137,13 +137,20 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Template-based caching support
+        # These fields are used for requests that leverage cached template prompts
+        # with dynamic attention masks for API selection
+        self.is_template_request: bool = False
+        self.template_id: str | None = None
+        self.template_mapping: Any | None = None  # TemplateMapping object
+
     @classmethod
     def from_engine_core_request(
         cls,
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        return cls(
+        req_obj = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -159,6 +166,17 @@ class Request:
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
         )
+
+        # Detect if this is a template-based request
+        # Template requests are identified by special extra_args
+        if request.sampling_params is not None and request.sampling_params.extra_args is not None:
+            extra_args = request.sampling_params.extra_args
+            # Check for template-related flags
+            if extra_args.get("use_template_cache", False):
+                req_obj.is_template_request = True
+                req_obj.template_id = extra_args.get("template_id", "default")
+
+        return req_obj
 
     def append_output_token_ids(
         self,
