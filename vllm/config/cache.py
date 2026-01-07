@@ -123,6 +123,25 @@ class CacheConfig:
     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
     for the ssm state will be determined by mamba_cache_dtype."""
 
+    # Template-based caching support
+    enable_template_caching: bool = False
+    """Enable template-based prefix caching with dynamic attention masks.
+    This allows caching a large template (e.g., 50-API prompt ~20K tokens) and
+    reusing it for requests with different subsets (e.g., 5-API prompt ~2K tokens)
+    by applying dynamic attention masks."""
+    template_config_path: str | None = None
+    """Path to YAML/JSON configuration file containing API template definitions.
+    The config file should specify template_id and a list of API descriptions
+    with api_id, api_name, description, and optional parameters."""
+    max_cached_templates: int = Field(default=5, gt=0)
+    """Maximum number of API templates to cache simultaneously in KV cache.
+    Uses LRU eviction when limit is exceeded. Each template consumes memory
+    proportional to its token count."""
+    template_match_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    """Minimum confidence score (0.0-1.0) for API matching from request prompts.
+    Higher values require stronger matches but may reduce detection rate.
+    Lower values increase detection but may cause false positives."""
+
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for GPU memory."""
@@ -181,6 +200,11 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
+            # Template caching runtime options
+            "enable_template_caching",
+            "template_config_path",
+            "max_cached_templates",
+            "template_match_threshold",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

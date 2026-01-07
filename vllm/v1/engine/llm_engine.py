@@ -115,6 +115,14 @@ class LLMEngine:
             log_stats=self.log_stats,
         )
 
+        # Initialize template-based caching system if enabled
+        if vllm_config.cache_config.enable_template_caching:
+            if tokenizer is not None:
+                self.engine_core.initialize_template_system(
+                    tokenizer=tokenizer,
+                    template_config_path=vllm_config.cache_config.template_config_path,
+                )
+
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(

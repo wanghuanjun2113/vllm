@@ -280,6 +280,33 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def initialize_template_system(
+        self,
+        tokenizer,
+        template_config_path: str | None = None,
+    ) -> bool:
+        """Initialize template-based caching system.
+
+        This method should be called after engine initialization when
+        tokenizer becomes available. It initializes the template registry,
+        loads templates from config, and sets up the template request mapper.
+
+        Args:
+            tokenizer: Tokenizer instance for template processing
+            template_config_path: Optional path to template config file
+
+        Returns:
+            True if initialization successful, False otherwise
+        """
+        if not hasattr(self.scheduler, 'initialize_template_system'):
+            logger.debug("Scheduler does not support template system initialization")
+            return False
+
+        return self.scheduler.initialize_template_system(
+            tokenizer=tokenizer,
+            template_config_path=template_config_path,
+        )
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 

@@ -199,6 +199,22 @@ class EngineCoreClient(ABC):
     async def get_output_async(self) -> EngineCoreOutputs:
         raise NotImplementedError
 
+    def initialize_template_system(
+        self,
+        tokenizer,
+        template_config_path: str | None = None,
+    ) -> bool:
+        """Initialize template-based caching system.
+
+        Args:
+            tokenizer: Tokenizer instance for template processing
+            template_config_path: Optional path to template config file
+
+        Returns:
+            True if initialization successful, False otherwise
+        """
+        raise NotImplementedError
+
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
@@ -340,6 +356,17 @@ class InprocClient(EngineCoreClient):
 
     def dp_engines_running(self) -> bool:
         return False
+
+    def initialize_template_system(
+        self,
+        tokenizer,
+        template_config_path: str | None = None,
+    ) -> bool:
+        """Initialize template-based caching system."""
+        return self.engine_core.initialize_template_system(
+            tokenizer=tokenizer,
+            template_config_path=template_config_path,
+        )
 
 
 @dataclass
@@ -807,6 +834,28 @@ class SyncMPClient(MPClient):
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         self.call_utility("save_sharded_state", path, pattern, max_size)
+
+    def initialize_template_system(
+        self,
+        tokenizer,
+        template_config_path: str | None = None,
+    ) -> bool:
+        """Initialize template-based caching system.
+
+        NOTE: In multiprocessing mode, tokenizer-based template initialization
+        is not supported because tokenizer objects cannot be serialized through
+        ZMQ. Template initialization must happen via config file path only,
+        which will be loaded by the engine process.
+
+        For multiprocessing mode, consider setting template_config_path in
+        CacheConfig before engine initialization.
+        """
+        logger.warning(
+            "Template system initialization with tokenizer is not supported "
+            "in multiprocessing mode. Please use template_config_path in "
+            "CacheConfig before engine initialization instead."
+        )
+        return False
 
 
 class AsyncMPClient(MPClient):

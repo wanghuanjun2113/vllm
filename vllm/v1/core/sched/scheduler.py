@@ -276,6 +276,73 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+    def initialize_template_system(
+        self,
+        tokenizer,
+        template_config_path: str | None = None,
+    ) -> bool:
+        """Initialize template system with tokenizer.
+
+        This method should be called after scheduler initialization when
+        tokenizer becomes available. It loads the template configuration
+        and initializes the TemplateRequestMapper.
+
+        Args:
+            tokenizer: Tokenizer instance for template processing
+            template_config_path: Optional path to template config file
+                                 (defaults to cache_config.template_config_path)
+
+        Returns:
+            True if initialization successful, False otherwise
+        """
+        if self.template_registry is None:
+            logger.debug("Template registry not initialized, skipping template system init")
+            return False
+
+        try:
+            # Use provided path or fall back to cache_config
+            config_path = template_config_path or getattr(
+                self.cache_config, 'template_config_path', None
+            )
+
+            # Load template from config if provided
+            if config_path:
+                logger.info(f"Loading template from config: {config_path}")
+                template = self.template_registry.load_template_from_config(
+                    config_path=config_path,
+                    tokenizer=tokenizer,
+                )
+                if template is not None:
+                    logger.info(
+                        f"Template '{template.template_id}' loaded with "
+                        f"{len(template.api_descriptions)} APIs"
+                    )
+                else:
+                    logger.warning(f"Failed to load template from {config_path}")
+
+            # Initialize template mapper with tokenizer
+            if self.template_mapper is None:
+                self.template_mapper = TemplateRequestMapper(
+                    registry=self.template_registry,
+                    tokenizer=tokenizer,
+                )
+                logger.info("TemplateRequestMapper initialized")
+
+                # Update KVCacheManager with the new template_mapper
+                if hasattr(self.kv_cache_manager, 'template_mapper'):
+                    self.kv_cache_manager.template_mapper = self.template_mapper
+                    logger.info("Updated KVCacheManager with template_mapper")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize template system: {e}")
+            # Disable template caching on error
+            self.template_registry = None
+            self.template_kv_manager = None
+            self.template_mapper = None
+            return False
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
