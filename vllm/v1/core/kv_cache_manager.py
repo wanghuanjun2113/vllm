@@ -189,35 +189,7 @@ class KVCacheManager:
             return self._get_template_cached_blocks(request)
 
         # Regular prefix caching logic
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
-
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
-            )
-        )
-
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
-                preempted=request.num_preemptions > 0,
-            )
-
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+        return self._get_regular_cached_blocks(request)
 
     def _get_template_cached_blocks(
         self,
@@ -249,8 +221,8 @@ class KVCacheManager:
                 "falling back to regular prefix caching"
             )
             request.is_template_request = False
-            # Recursively call get_computed_blocks for regular processing
-            return self.get_computed_blocks(request)
+            # Use regular prefix caching (non-recursive)
+            return self._get_regular_cached_blocks(request)
 
         # Store mapping for attention mask generation
         request.template_mapping = mapping
@@ -281,7 +253,7 @@ class KVCacheManager:
                 "falling back to regular processing"
             )
             request.is_template_request = False
-            return self.get_computed_blocks(request)
+            return self._get_regular_cached_blocks(request)
 
         # Convert template blocks to KVCacheBlocks format
         # template_blocks is a list of blocks, need to create tuple for each group
@@ -305,6 +277,43 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_computed_tokens
+
+    def _get_regular_cached_blocks(
+        self,
+        request: Request,
+    ) -> tuple[KVCacheBlocks, int]:
+        """Get cached blocks using regular prefix caching (non-template path).
+
+        This is the fallback path when template caching is not used or fails.
+
+        Args:
+            request: The request
+
+        Returns:
+            Tuple of (KVCacheBlocks, num_computed_tokens)
+        """
+        # We skip finding the prefix cache hit when prefix caching is
+        # disabled or the request is marked as skipping kv cache read
+        if not self.enable_caching or request.skip_reading_prefix_cache:
+            return self.empty_kv_cache_blocks, 0
+
+        # Regular prefix caching logic
+        max_cache_hit_length = request.num_tokens - 1
+        computed_blocks, num_new_computed_tokens = (
+            self.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_cache_hit_length
+            )
+        )
+
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record(
+                num_tokens=request.num_tokens,
+                num_hits=num_new_computed_tokens,
+                preempted=request.num_preemptions > 0,
+            )
+
+        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def allocate_slots(
         self,
