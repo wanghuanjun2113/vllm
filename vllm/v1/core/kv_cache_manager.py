@@ -239,18 +239,23 @@ class KVCacheManager:
         template_blocks = self.template_kv_manager.get_template_blocks(template_id)
 
         if template_blocks is None:
-            # Template not cached yet - need to register it
+            # Template not cached yet - mark for lazy registration
             logger.info(
                 f"Template '{template_id}' not cached yet, "
-                f"triggering registration for request '{request.request_id}'"
+                f"marking for pending registration for request '{request.request_id}'"
             )
 
-            # TODO: Trigger template registration
-            # This requires integration with model executor
-            # For now, fall back to regular processing
-            logger.warning(
-                f"Template '{template_id}' registration not yet implemented, "
-                "falling back to regular processing"
+            # Mark template for lazy registration
+            # The actual registration will be triggered by the engine
+            # when it has access to the model executor
+            self.template_kv_manager.mark_for_registration(template)
+
+            # For this request, fall back to regular processing
+            # Future requests will be able to use the cached template
+            logger.info(
+                f"Template '{template_id}' added to pending registration queue. "
+                "This request will use regular prefix caching. "
+                "Future requests can use the cached template after registration."
             )
             request.is_template_request = False
             return self._get_regular_cached_blocks(request)

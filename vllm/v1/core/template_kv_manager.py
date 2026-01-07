@@ -69,6 +69,10 @@ class TemplateKVCacheManager:
         self.registration_locks: dict[str, threading.Lock] = {}
         self.registration_lock = threading.Lock()
 
+        # Pending templates waiting for registration
+        self.pending_registrations: dict[str, "APITemplate"] = {}
+        self.pending_lock = threading.Lock()
+
         # Metrics tracking
         self.total_registrations = 0
         self.total_evictions = 0
@@ -246,6 +250,79 @@ class TemplateKVCacheManager:
             "This is a placeholder implementation."
         )
         return None
+
+    def mark_for_registration(self, template: "APITemplate") -> None:
+        """Mark a template for lazy registration.
+
+        This adds the template to a pending queue. Registration should be
+        triggered externally (e.g., by LLMEngine during initialization
+        or by a background process).
+
+        Args:
+            template: The APITemplate to register
+        """
+        with self.pending_lock:
+            if template.template_id not in self.template_blocks:
+                self.pending_registrations[template.template_id] = template
+                logger.info(
+                    f"Template '{template.template_id}' marked for pending registration "
+                    f"({len(template.prompt_token_ids)} tokens, {len(template.api_descriptions)} APIs)"
+                )
+
+    def get_pending_registrations(self) -> list["APITemplate"]:
+        """Get all templates waiting for registration.
+
+        Returns:
+            List of templates pending registration
+        """
+        with self.pending_lock:
+            return list(self.pending_registrations.values())
+
+    def clear_pending_registration(self, template_id: str) -> None:
+        """Remove a template from the pending queue.
+
+        Args:
+            template_id: The template to remove from pending queue
+        """
+        with self.pending_lock:
+            self.pending_registrations.pop(template_id, None)
+
+    def manual_register_template(
+        self,
+        template_id: str,
+        prompt_tokens: list[int],
+        model_executor: "ModelRunner" = None,
+    ) -> bool:
+        """Manually trigger template registration.
+
+        This allows external systems (like LLMEngine) to register templates
+        when they have access to the model executor.
+
+        Args:
+            template_id: ID of the template to register
+            prompt_tokens: Token IDs for the full template prompt
+            model_executor: Model executor instance (optional)
+
+        Returns:
+            True if registration succeeded, False otherwise
+        """
+        template = self.registry.get_template(template_id)
+        if template is None:
+            logger.error(f"Cannot register unknown template '{template_id}'")
+            return False
+
+        if template.is_cached:
+            logger.info(f"Template '{template_id}' already cached")
+            return True
+
+        if model_executor is None:
+            logger.error(
+                f"Model executor is required for template registration. "
+                f"Please provide model_executor or call this during initialization."
+            )
+            return False
+
+        return self.cache_template(template, model_executor)
 
     def evict_lru_template(self) -> Optional[str]:
         """Evict the least recently used template from cache.
