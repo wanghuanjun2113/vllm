@@ -343,6 +343,38 @@ class Scheduler(SchedulerInterface):
             self.template_mapper = None
             return False
 
+    def _process_pending_template_registrations(self) -> None:
+        """Process pending template registrations by submitting prefill requests.
+
+        This method is called at the beginning of each schedule() call to check
+        if there are any templates waiting to be registered and submit them as
+        temporary requests for prefill.
+        """
+        if self.template_kv_manager is None:
+            return
+
+        pending = self.template_kv_manager.get_pending_registrations()
+        if not pending:
+            return
+
+        logger.info(f"Processing {len(pending)} pending template registrations")
+
+        for template in pending:
+            # Submit template for prefill via request
+            success = self.template_kv_manager.register_template_via_request(
+                template=template,
+                scheduler=self,
+            )
+
+            if success:
+                # Clear from pending queue
+                self.template_kv_manager.clear_pending_registration(
+                    template.template_id
+                )
+                logger.info(f"Template '{template.template_id}' submitted for prefill")
+            else:
+                logger.warning(f"Failed to submit template '{template.template_id}' for prefill")
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -354,6 +386,10 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # Process pending template registrations
+        if self.template_kv_manager is not None:
+            self._process_pending_template_registrations()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []

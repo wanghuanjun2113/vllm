@@ -1057,10 +1057,17 @@ def use_cascade_attention(
         attn_metadata: FlashAttentionMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply template masks to KV cache.
+        Apply template masks to KV cache for decode phase.
 
         This zeroes out KV cache entries for non-selected API tokens,
-        preventing attention from attending to masked tokens.
+        preventing attention from attending to masked tokens during decode.
+
+        NOTE: This is a simplified implementation that works for basic cases.
+        A full production implementation would need to handle:
+        - Multi-GPU tensor parallelism
+        - Complex block sharing patterns
+        - Sliding window attention
+        - Speculative decoding
 
         Args:
             key_cache: Key cache of shape (num_blocks, block_size, num_kv_heads, head_size)
@@ -1073,20 +1080,88 @@ def use_cascade_attention(
         if attn_metadata.template_kv_masks is None:
             return key_cache, value_cache
 
-        # Note: This is a simplified implementation.
-        # A complete implementation would need to map token positions
-        # to block positions using block_table and slot_mapping.
-        # For now, this is a placeholder showing the intended logic.
+        if len(attn_metadata.template_kv_masks) == 0:
+            return key_cache, value_cache
 
-        # TODO: Implement proper block-level masking
-        # This requires:
-        # 1. Mapping token positions to blocks using block_table
-        # 2. Zeroing out KV entries in those blocks
-        # 3. Handling complex block layouts
+        # Clone to avoid modifying original cache
+        masked_key_cache = key_cache.clone()
+        masked_value_cache = value_cache.clone()
 
-        # For now, return as-is (no masking)
-        # This will be completed in a future update
-        return key_cache, value_cache
+        # Get decode metadata
+        block_table = attn_metadata.block_table  # (num_seqs, max_blocks_per_seq)
+        slot_mapping = attn_metadata.slot_mapping  # (num_tokens,)
+        seq_lens = attn_metadata.seq_lens  # (num_seqs,)
+
+        if block_table is None or slot_mapping is None:
+            return masked_key_cache, masked_value_cache
+
+        num_seqs = len(seq_lens)
+        block_size = key_cache.shape[1]  # block_size dimension
+
+        # Process each sequence
+        for seq_idx in range(num_seqs):
+            if seq_idx >= len(attn_metadata.template_kv_masks):
+                break
+
+            kv_mask = attn_metadata.template_kv_masks[seq_idx]
+            if kv_mask is None:
+                continue
+
+            # Convert mask to tensor if needed
+            if not isinstance(kv_mask, torch.Tensor):
+                kv_mask = torch.tensor(kv_mask, dtype=torch.bool, device=key_cache.device)
+
+            # Get sequence's block table
+            seq_blocks = block_table[seq_idx]  # (max_blocks_per_seq,)
+            seq_len = seq_lens[seq_idx].item() if hasattr(seq_lens[seq_idx], 'item') else seq_lens[seq_idx]
+
+            # Determine how many full blocks this sequence uses
+            num_full_blocks = seq_len // block_size
+            remaining_tokens = seq_len % block_size
+
+            # Process full blocks
+            for block_idx in range(num_full_blocks):
+                if block_idx >= len(seq_blocks):
+                    break
+
+                physical_block = seq_blocks[block_idx].item()
+                if physical_block < 0:  # Invalid block
+                    continue
+
+                # Get mask range for this block
+                mask_start = block_idx * block_size
+                mask_end = mask_start + block_size
+
+                if mask_start >= len(kv_mask):
+                    continue
+
+                mask_end = min(mask_end, len(kv_mask))
+                block_mask = kv_mask[mask_start:mask_end]
+
+                # Apply mask: zero out masked positions in this block
+                # block_mask might be shorter than block_size (partial block)
+                for i, should_keep in enumerate(block_mask):
+                    if not should_keep and i < block_size:
+                        # Zero out KV for this position
+                        masked_key_cache[physical_block, i, :, :] = 0
+                        masked_value_cache[physical_block, i, :, :] = 0
+
+            # Process partial block (if any)
+            if remaining_tokens > 0 and num_full_blocks < len(seq_blocks):
+                physical_block = seq_blocks[num_full_blocks].item()
+                if physical_block >= 0:
+                    mask_start = num_full_blocks * block_size
+                    mask_end = min(mask_start + remaining_tokens, len(kv_mask))
+
+                    if mask_start < len(kv_mask):
+                        block_mask = kv_mask[mask_start:mask_end]
+
+                        for i, should_keep in enumerate(block_mask):
+                            if not should_keep and i < remaining_tokens:
+                                masked_key_cache[physical_block, i, :, :] = 0
+                                masked_value_cache[physical_block, i, :, :] = 0
+
+        return masked_key_cache, masked_value_cache
 
 
 def cascade_attention(
