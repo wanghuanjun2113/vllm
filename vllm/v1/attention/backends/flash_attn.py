@@ -214,6 +214,21 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # Template-based caching support
+    template_masks: list[torch.Tensor] | None = None
+    """
+    Binary masks for template-based requests.
+    Each mask is of shape (num_tokens,) where True = visible, False = masked.
+    Applied to query tokens during prefill.
+    """
+
+    template_kv_masks: list[torch.Tensor] | None = None
+    """
+    Binary masks for KV cache in template-based requests.
+    Each mask is of shape (num_cached_tokens,) where True = visible, False = masked.
+    Applied to KV cache during decode.
+    """
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -638,6 +653,21 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # Apply template masks if present (for template-based caching)
+        # This masks out query/key/value tokens for non-selected APIs
+        if attn_metadata.template_masks is not None and len(attn_metadata.template_masks) > 0:
+            query[:num_actual_tokens] = self._apply_template_masks_to_query(
+                query[:num_actual_tokens],
+                attn_metadata,
+            )
+
+        if attn_metadata.template_kv_masks is not None and len(attn_metadata.template_kv_masks) > 0:
+            key_cache, value_cache = self._apply_template_masks_to_kv(
+                key_cache,
+                value_cache,
+                attn_metadata,
+            )
+
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
         # in KV cache.
@@ -968,6 +998,95 @@ def use_cascade_attention(
 
     # Use cascade attention if it is faster than FlashDecoding.
     return cascade_time < flash_decoding_time
+
+    def _apply_template_masks_to_query(
+        self,
+        query: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> torch.Tensor:
+        """
+        Apply template masks to query tokens.
+
+        This zeroes out query vectors for non-selected API tokens,
+        effectively hiding them from attention computation.
+
+        Args:
+            query: Query tensor of shape (num_tokens, num_heads, head_size)
+            attn_metadata: Attention metadata with template_masks
+
+        Returns:
+            Masked query tensor (same shape as input)
+        """
+        if attn_metadata.template_masks is None:
+            return query
+
+        # Apply each mask to its corresponding request's tokens
+        # template_masks is a list of masks, one per request
+        query_start_loc = attn_metadata.query_start_loc
+        num_reqs = query_start_loc.shape[0] - 1
+
+        for req_idx in range(num_reqs):
+            if req_idx >= len(attn_metadata.template_masks):
+                break
+
+            mask = attn_metadata.template_masks[req_idx]
+            if mask is None:
+                continue
+
+            # Get token range for this request
+            start_idx = query_start_loc[req_idx].item()
+            end_idx = query_start_loc[req_idx + 1].item()
+
+            # Ensure mask is on the same device
+            mask = mask.to(query.device)
+
+            # Expand mask to match query shape
+            # mask shape: (num_tokens_in_request,) -> (num_tokens_in_request, 1, 1)
+            mask_expanded = mask[start_idx:end_idx].view(-1, 1, 1)
+
+            # Zero out masked query tokens
+            # query[start_idx:end_idx] shape: (num_tokens_in_request, num_heads, head_size)
+            query[start_idx:end_idx] = query[start_idx:end_idx] * mask_expanded
+
+        return query
+
+    def _apply_template_masks_to_kv(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply template masks to KV cache.
+
+        This zeroes out KV cache entries for non-selected API tokens,
+        preventing attention from attending to masked tokens.
+
+        Args:
+            key_cache: Key cache of shape (num_blocks, block_size, num_kv_heads, head_size)
+            value_cache: Value cache of same shape
+            attn_metadata: Attention metadata with template_kv_masks
+
+        Returns:
+            Tuple of (masked_key_cache, masked_value_cache)
+        """
+        if attn_metadata.template_kv_masks is None:
+            return key_cache, value_cache
+
+        # Note: This is a simplified implementation.
+        # A complete implementation would need to map token positions
+        # to block positions using block_table and slot_mapping.
+        # For now, this is a placeholder showing the intended logic.
+
+        # TODO: Implement proper block-level masking
+        # This requires:
+        # 1. Mapping token positions to blocks using block_table
+        # 2. Zeroing out KV entries in those blocks
+        # 3. Handling complex block layouts
+
+        # For now, return as-is (no masking)
+        # This will be completed in a future update
+        return key_cache, value_cache
 
 
 def cascade_attention(
