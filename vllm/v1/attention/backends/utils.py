@@ -96,6 +96,23 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    # Template-based caching support
+    template_masks: list[torch.Tensor] | None = None
+    """
+    List of binary masks for template-based requests.
+    Each mask is a boolean tensor of shape (num_tokens_in_template,)
+    where True = attend to this token, False = ignore.
+    Only set for requests using template caching (len = num_reqs or None).
+    """
+
+    template_kv_masks: list[torch.Tensor] | None = None
+    """
+    List of binary masks for KV cache in template-based requests.
+    Each mask is a boolean tensor of shape (num_cached_tokens,)
+    where True = allow attention to this KV entry, False = ignore.
+    Only set for requests using template caching (len = num_reqs or None).
+    """
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.14.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
