@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.chunk_metadata import ChunkMetadata
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
@@ -81,6 +82,15 @@ class EngineCoreRequest(
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
 
+    # Chunk metadata for position-agnostic chunk cache.
+    # If provided, indicates this request uses chunk-based caching
+    # instead of standard prefix caching.
+    chunk_metadata: list[ChunkMetadata] | None = None
+
+    # Flag indicating whether this request contains chunks.
+    # This is a convenience field derived from chunk_metadata.
+    has_chunks: bool = False
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -88,6 +98,28 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+    def get_chunk_hashes(self) -> list[str]:
+        """
+        Get the list of chunk hashes for this request.
+
+        Returns:
+            List of chunk hashes, or empty list if no chunks.
+        """
+        if not self.chunk_metadata:
+            return []
+        return [meta.chunk_hash for meta in self.chunk_metadata]
+
+    def get_total_chunk_tokens(self) -> int:
+        """
+        Get the total number of tokens across all chunks.
+
+        Returns:
+            Total token count, or 0 if no chunks.
+        """
+        if not self.chunk_metadata:
+            return 0
+        return sum(meta.get_num_tokens() for meta in self.chunk_metadata)
 
 
 class EngineCoreEventType(enum.IntEnum):

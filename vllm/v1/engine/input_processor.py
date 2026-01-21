@@ -8,6 +8,7 @@ from typing import Any, Literal, cast
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
+from vllm.inputs.chunk_parser import ChunkParser
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -24,6 +25,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.chunk_metadata import ChunkMetadata
 from vllm.v1.metrics.stats import MultiModalCacheStats
 from vllm.v1.structured_output.backend_guidance import (
     has_guidance_unsupported_json_features,
@@ -65,6 +67,9 @@ class InputProcessor:
             mm_registry,
             mm_processor_cache=self.mm_processor_cache,
         )
+
+        # Initialize chunk parser for position-agnostic chunk cache
+        self.chunk_parser = ChunkParser()
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -437,6 +442,73 @@ class InputProcessor:
         request.external_req_id = request.request_id
         request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
 
+    def _process_chunks(
+        self,
+        prompt_text: str,
+        request_id: str,
+    ) -> list[ChunkMetadata] | None:
+        """
+        Process chunk-based prompts for position-agnostic chunk cache.
+
+        Args:
+            prompt_text: The text prompt to parse for chunks
+            request_id: The request ID for generating chunk IDs
+
+        Returns:
+            List of ChunkMetadata if chunks are found, None otherwise
+        """
+        # Check if prompt contains chunk delimiters
+        if not self.chunk_parser.has_chunks(prompt_text):
+            return None
+
+        if self.tokenizer is None:
+            logger.warning_once(
+                "Chunk cache requires tokenizer, but tokenizer is not initialized. "
+                "Falling back to normal processing."
+            )
+            return None
+
+        # Parse the prompt into chunks
+        parse_result = self.chunk_parser.parse(prompt_text)
+
+        if not parse_result.has_chunks:
+            return None
+
+        logger.debug(
+            f"Request {request_id}: detected {parse_result.get_num_chunks()} chunks"
+        )
+
+        # Tokenize system prompt
+        system_tokens = self.input_preprocessor._tokenize_prompt(
+            parse_result.system_prompt
+        )
+
+        # Process each chunk independently
+        chunk_metadata_list = []
+        for chunk_idx, chunk_text in enumerate(parse_result.chunks):
+            # Combine system prompt with chunk
+            combined_text = parse_result.system_prompt + " " + chunk_text
+            combined_tokens = self.input_preprocessor._tokenize_prompt(combined_text)
+
+            # Create chunk metadata
+            chunk_id = f"{request_id}_chunk_{chunk_idx}"
+            chunk_meta = ChunkMetadata(
+                chunk_id=chunk_id,
+                token_ids=combined_tokens,
+                chunk_hash="",  # Will be computed in __post_init__
+                position_offset=0,  # Will be computed later
+                dependencies=[],
+                kv_cache_blocks=None,
+            )
+            chunk_metadata_list.append(chunk_meta)
+
+            logger.debug(
+                f"Chunk {chunk_idx}: {len(combined_tokens)} tokens, "
+                f"hash={chunk_meta.chunk_hash[:16]}..."
+            )
+
+        return chunk_metadata_list
+
     def process_inputs(
         self,
         request_id: str,
@@ -493,6 +565,21 @@ class InputProcessor:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
+
+        # Extract text prompt for chunk detection (before preprocessing)
+        prompt_text_for_chunks = None
+        if isinstance(prompt, str):
+            prompt_text_for_chunks = prompt
+        elif isinstance(prompt, dict) and "prompt" in prompt:
+            prompt_text_for_chunks = prompt["prompt"] if isinstance(prompt["prompt"], str) else None
+
+        # Process chunks if delimiter is present
+        chunk_metadata: list[ChunkMetadata] | None = None
+        has_chunks = False
+        if prompt_text_for_chunks:
+            chunk_metadata = self._process_chunks(prompt_text_for_chunks, request_id)
+            has_chunks = chunk_metadata is not None
+
         with set_request_id(request_id):
             processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
                 prompt,
@@ -583,6 +670,8 @@ class InputProcessor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            chunk_metadata=chunk_metadata,
+            has_chunks=has_chunks,
         )
 
     def _validate_model_inputs(
