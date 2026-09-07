@@ -55,11 +55,11 @@ class Transport:
         if self.error:
             raise RuntimeError("flight recorder failed; trace is incomplete") from self.error
 
-    def submit(self, meta, arrays=None, event=None):
+    def submit(self, meta, arrays=None, event=None, on_done=None):
         self.check()
         while True:
             try:
-                self.queue.put((meta, arrays or {}, event), timeout=0.2)
+                self.queue.put((meta, arrays or {}, event, on_done), timeout=0.2)
                 self.check()
                 return
             except queue.Full:
@@ -72,7 +72,7 @@ class Transport:
                 try:
                     if item is None:
                         return
-                    meta, arrays, event = item
+                    meta, arrays, event, on_done = item
                     if event is not None:
                         event.synchronize()
                     # CPU tensors and their pinned storage stay alive until IPC completes.
@@ -84,6 +84,8 @@ class Transport:
                     self.proc.stdin.flush()
                     if self.proc.stdout.read(1) != b"1":
                         raise IOError("writer died before durable acknowledgement")
+                    if on_done is not None:
+                        on_done()
                 finally:
                     self.queue.task_done()
         except BaseException as exc:
@@ -133,6 +135,90 @@ def request_start(request):
                  sampling_params_complete=True, timestamp=time.time())
 
 
+
+def summarize_shared_snapshot(meta, arrays, mappings, executor):
+    """Read a pool slot only while its producer retains ownership (until ACK)."""
+    import mmap
+    import numpy as np
+    started = time.perf_counter_ns()
+    path = meta["shared_path"]
+    if path not in mappings:
+        with open(path, "rb") as source:
+            mappings[path] = mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ)
+    capacity, vocab, slot = meta["capacity_rows"], meta["vocab"], meta["shared_slot"]
+    plane_bytes = capacity * vocab * 4
+    raw = np.ndarray((capacity, vocab), np.float32, buffer=mappings[path],
+                     offset=slot * 2 * plane_bytes)
+    final = np.ndarray((capacity, vocab), np.float32, buffer=mappings[path],
+                       offset=slot * 2 * plane_bytes + plane_bytes)
+    selected = arrays["selected"].reshape(-1)
+    width = meta["width"]
+    drafts = meta["num_draft_tokens"]
+    starts = np.cumsum([0] + [n + 1 for n in drafts[:-1]]) if drafts else np.arange(len(meta["req_ids"]))
+    ignored = set(meta["discard_rows"])
+    tasks = []
+    for flat, token in enumerate(selected):
+        req, column = divmod(flat, width)
+        if token < 0 or req in ignored:
+            continue
+        row = int(starts[req] + min(column, drafts[req])) if drafts else req
+        if not arrays["row_filled"][row]:
+            raise ValueError("missing processed snapshot row")
+        tasks.append((flat, row, int(token)))
+    k = meta["top_k"]
+    probe_ids = meta["probe_ids"]
+
+    def statistics(row, token):
+        ids = np.argpartition(row, vocab-k)[-k:]
+        vals = row[ids]
+        order = np.lexsort((ids, -vals))
+        maximum = float(np.max(row))
+        if np.isfinite(maximum):
+            shifted = row.astype(np.float64) - maximum
+            np.exp(shifted, out=shifted)
+            lse = maximum + np.log(shifted.sum())
+        else:
+            lse = maximum  # Preserve NaN/Inf evidence; no invented distribution.
+        probes = row[[token] + probe_ids]
+        return {
+            "ids": ids[order].astype(np.int32), "values": vals[order],
+            "lse": lse,
+            "counts": np.array([np.isfinite(row).sum(), np.isnan(row).sum(),
+                                np.isposinf(row).sum(), np.isneginf(row).sum()],np.int32),
+            "probe_values": probes,
+            "probe_ranks": np.array([np.count_nonzero(row > value)+1 for value in probes],np.int32),
+        }
+
+    def calculate(task):
+        flat, row, token = task
+        raw_stats = statistics(raw[row], token)
+        # Exact snapshot equality permits reusing statistics, including counts/ranks.
+        final_stats = raw_stats if np.array_equal(raw[row], final[row]) else statistics(final[row], token)
+        return flat, raw_stats, final_stats
+
+    result = {"selected": selected.astype(np.int32), "final_seen": np.zeros(len(selected),bool)}
+    for stage in ("raw","final"):
+        for key, shape, dtype in (
+            ("ids",(len(selected),k),np.int32),("values",(len(selected),k),np.float32),
+            ("lse",(len(selected),),np.float64),("counts",(len(selected),4),np.int32),
+            ("probe_values",(len(selected),len(probe_ids)+1),np.float32),
+            ("probe_ranks",(len(selected),len(probe_ids)+1),np.int32)):
+            result[stage+"_"+key] = np.zeros(shape,dtype)
+    for flat, raw_stats, final_stats in executor.map(calculate, tasks):
+        result["final_seen"][flat] = True
+        for stage, stats in (("raw",raw_stats),("final",final_stats)):
+            for key,value in stats.items():
+                result[stage+"_"+key][flat] = value
+    if "draft_ids" in arrays:
+        result["draft_ids"] = arrays["draft_ids"]
+    meta = {key:value for key,value in meta.items()
+            if key not in ("shared_path","capacity_rows","vocab","shared_slot")}
+    meta["kind"] = "batch"
+    meta["summary_backend"] = "cpu_pool"
+    meta["cpu_statistics_ns"] = time.perf_counter_ns() - started
+    return meta,result
+
+
 def writer(root, shard):
     import numpy as np
     root = Path(root)
@@ -147,6 +233,9 @@ def writer(root, shard):
     db.execute("CREATE TABLE IF NOT EXISTS events "
                "(id INTEGER PRIMARY KEY, request_id TEXT, kind TEXT, data TEXT)")
     positions = {}
+    from concurrent.futures import ThreadPoolExecutor
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trace-cpu")
+    mappings = {}
     with (root / (shard + ".bin")).open("ab") as f:
         while True:
             header = sys.stdin.buffer.read(8)
@@ -155,6 +244,8 @@ def writer(root, shard):
             if len(header) != 8:
                 raise EOFError("partial IPC header")
             meta, arrays = pickle.loads(_read_exact(sys.stdin.buffer, struct.unpack("<Q", header)[0]))
+            if meta["kind"] == "snapshot":
+                meta, arrays = summarize_shared_snapshot(meta, arrays, mappings, executor)
             if meta["kind"] == "batch":
                 selected = arrays["selected"].reshape(-1)
                 width = meta["width"]
@@ -190,6 +281,9 @@ def writer(root, shard):
             sys.stdout.buffer.write(b"1")
             sys.stdout.buffer.flush()
     db.close()
+    executor.shutdown()
+    for mapping in mappings.values():
+        mapping.close()
     (root / (shard + ".closed")).write_text("durably closed\n")
 
 
