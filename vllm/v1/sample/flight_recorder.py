@@ -128,8 +128,9 @@ def request_start(request):
     record_event("request", request.request_id,
                  external_req_id=request.external_req_id,
                  prompt_token_ids=request.prompt_token_ids,
-                 sampling_params=msgspec.to_builtins(params),
-                 timestamp=time.time())
+                 sampling_params=msgspec.to_builtins({name: getattr(params, name)
+                     for name in params.__struct_fields__}),
+                 sampling_params_complete=True, timestamp=time.time())
 
 
 def writer(root, shard):
