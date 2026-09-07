@@ -146,6 +146,8 @@ class TopKTopPSampler(nn.Module):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+        from vllm.v1.sample.flight_recorder import capture_processed
+        capture_processed(logits, None)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         return (
             random_sample(probs, generators, self.use_fp64_gumbel),

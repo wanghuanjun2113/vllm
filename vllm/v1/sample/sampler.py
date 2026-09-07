@@ -253,6 +253,8 @@ class Sampler(nn.Module):
         """
 
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        from vllm.v1.sample.flight_recorder import capture_processed
+        capture_processed(logits, sampling_metadata)
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
         if sampling_metadata.all_random:
             greedy_sampled = None

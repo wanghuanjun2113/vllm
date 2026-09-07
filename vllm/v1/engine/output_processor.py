@@ -483,6 +483,8 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                from vllm.v1.sample.flight_recorder import record_event
+                record_event("abort", request_id)
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -533,6 +535,8 @@ class OutputProcessor:
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
+        from vllm.v1.sample.flight_recorder import request_start
+        request_start(request)
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
@@ -646,6 +650,11 @@ class OutputProcessor:
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
+
+            from vllm.v1.sample.flight_recorder import record_event
+            record_event("output", req_id, token_ids=list(new_token_ids),
+                         finish_reason=str(finish_reason) if finish_reason is not None else None,
+                         stop_reason=stop_reason)
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
